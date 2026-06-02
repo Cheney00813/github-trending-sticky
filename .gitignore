@@ -1,0 +1,25 @@
+# Generated / cache files
+__pycache__/
+*.pyc
+*.pyo
+cache.json
+scheduler_state.json
+scheduler.log
+
+# Generated output
+sticky.html
+
+# Temp files
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Skill package (binary artifact)
+*.skill
