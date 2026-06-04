@@ -262,8 +262,14 @@ def _call_gh_api(endpoint: str) -> str:
     raise last_error
 
 
-def fetch_trending_repos() -> list[RepoInfo]:
+def fetch_trending_repos(since_days: int = SEARCH_WINDOW_DAYS, count: int = MAX_REPOS,
+                          language: str | None = None) -> list[RepoInfo]:
     """Fetch trending repositories from GitHub API.
+
+    Args:
+        since_days: How many days back to search (default 7).
+        count: Number of repos to fetch (default 10, max 100).
+        language: Optional language filter (e.g. 'Python', 'Rust').
 
     Returns:
         List of validated RepoInfo objects, sorted by stars desc.
@@ -274,17 +280,23 @@ def fetch_trending_repos() -> list[RepoInfo]:
         ParseError: If response is not valid JSON.
         InvalidResponseError: If API response is missing required fields.
     """
-    since_date = (datetime.now(timezone.utc) - timedelta(days=SEARCH_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    since_date = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%d")
+
+    query = f"created:>{since_date}"
+    if language:
+        query += f"+language:{language}"
 
     endpoint = (
         "/search/repositories"
-        f"?q=created:>{since_date}"
+        f"?q={query}"
         "&sort=stars"
         "&order=desc"
-        f"&per_page={MAX_REPOS}"
+        f"&per_page={min(count, 100)}"
     )
 
     print(f"[INFO] Fetching repos created since {since_date}...")
+    if language:
+        print(f"[INFO] Language filter: {language}")
     raw_json = _call_gh_api(endpoint)
 
     # ── Parse JSON with explicit error context ──
@@ -485,9 +497,29 @@ def _format_stars(stars: int) -> str:
     return str(stars)
 
 
-def generate_html(repos: list[RepoInfo]) -> str:
+def _relative_time(iso_string: str) -> str:
+    """Convert ISO datetime to relative time display (e.g. '2d ago', '12h ago')."""
+    if not iso_string:
+        return ""
+    try:
+        created = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - created.replace(tzinfo=timezone.utc)
+        if delta.days > 0:
+            return f"{delta.days}d ago"
+        hours = delta.seconds // 3600
+        if hours > 0:
+            return f"{hours}h ago"
+        minutes = delta.seconds // 60
+        return f"{minutes}m ago"
+    except (ValueError, TypeError):
+        return ""
+
+
+def generate_html(repos: list[RepoInfo], since_days: int = SEARCH_WINDOW_DAYS,
+                   language: str | None = None) -> str:
     """Generate a self-contained HTML sticky note page with Cyberpunk Terminal aesthetic."""
     update_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lang_tag = f" lang:{language}" if language else ""
 
     repo_cards_parts: list[str] = []
     for i, repo in enumerate(repos):
@@ -498,6 +530,8 @@ def generate_html(repos: list[RepoInfo]) -> str:
         stars_display = _format_stars(repo.stars)
         topics_html = _topic_tags(repo.topics)
         delay = 0.05 * i
+        rel_time = _relative_time(repo.created_at)
+        time_html = f'<span class="meta-item time" title="{_escape_html(repo.created_at)}">{_escape_html(rel_time)}</span>' if rel_time else ""
 
         repo_cards_parts.append(f"""
             <div class="repo-card" style="animation-delay:{delay:.2f}s">
@@ -508,9 +542,10 @@ def generate_html(repos: list[RepoInfo]) -> str:
                     {topics_html}
                     <div class="repo-meta">
                         <span class="meta-item"><span class="lang-dot" style="background:{lang_dot}"></span>{_escape_html(repo.language)}</span>
-                        <span class="meta-item sep">┃</span>
-                        <span class="meta-item star">✦ {stars_display}</span>
-                        <span class="meta-item fork">⑂ {repo.forks:,}</span>
+                        <span class="meta-item sep">|</span>
+                        <span class="meta-item star">* {stars_display}</span>
+                        <span class="meta-item fork">v {repo.forks:,}</span>
+                        {time_html}
                     </div>
                 </div>
             </div>""")
@@ -524,6 +559,8 @@ def generate_html(repos: list[RepoInfo]) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="refresh" content="7200">
 <title>GH Trending</title>
+<script>(function(){{var w=420,h=720,sw=screen.availWidth,sh=screen.availHeight;window.resizeTo(w,h);window.moveTo(Math.round((sw-w)/2),Math.round((sh-h)/2));}})();
+document.addEventListener('click',function(e){{var a=e.target.closest('a');if(a&&a.href){{e.preventDefault();window.open(a.href,'_blank');}}}});</script>
 <style>
 :root {{
     --bg-deep: #06090f;
@@ -683,7 +720,7 @@ body {{
     <div class="header-icon">◈</div>
     <div class="header-title"><span class="header-prompt">$</span> github-trending</div>
     <div class="header-subtitle">
-        repos created since <span class="highlight">--since=7d</span>
+        repos created since <span class="highlight">--since={since_days}d{lang_tag}</span>
          ·  refreshed <span class="highlight">{update_time}</span>
     </div>
 </div>
@@ -714,6 +751,37 @@ def main() -> None:
         1 — Recoverable error (cache fallback used)
         2 — Fatal error (no output generated)
     """
+    # ── CLI argument parsing (stdlib only, no argparse overhead) ──
+    args = sys.argv[1:]
+    language: str | None = None
+    since_days = SEARCH_WINDOW_DAYS
+    count = MAX_REPOS
+    output_path = OUTPUT_HTML
+    i = 0
+    while i < len(args):
+        if args[i] in ("--language", "-l") and i + 1 < len(args):
+            language = args[i + 1]; i += 2
+        elif args[i] in ("--since", "-s") and i + 1 < len(args):
+            try: since_days = int(args[i + 1])
+            except ValueError: print(f"[WARN] Invalid --since value, using {since_days}", file=sys.stderr)
+            i += 2
+        elif args[i] in ("--count", "-n") and i + 1 < len(args):
+            try: count = int(args[i + 1])
+            except ValueError: print(f"[WARN] Invalid --count value, using {count}", file=sys.stderr)
+            i += 2
+        elif args[i] in ("--output", "-o") and i + 1 < len(args):
+            output_path = args[i + 1]; i += 2
+        elif args[i] in ("--help", "-h"):
+            print("Usage: python fetch_trending.py [OPTIONS]")
+            print("  -l, --language LANG   Filter by language (e.g. Python, Rust)")
+            print(f"  -s, --since DAYS      Days to look back (default: {SEARCH_WINDOW_DAYS})")
+            print(f"  -n, --count N         Number of repos (default: {MAX_REPOS})")
+            print(f"  -o, --output PATH     Output HTML file (default: sticky.html)")
+            print("  -h, --help            Show this help")
+            sys.exit(0)
+        else:
+            i += 1
+
     # ── Pre-flight checks ──
     try:
         _check_gh_cli()
@@ -727,7 +795,7 @@ def main() -> None:
     used_cache = False
 
     try:
-        repos = fetch_trending_repos()
+        repos = fetch_trending_repos(since_days=since_days, count=count, language=language)
     except RateLimitError as e:
         print(f"[WARN] {e}", file=sys.stderr)
         repos = _load_cache()
@@ -755,15 +823,15 @@ def main() -> None:
 
     # ── Generate HTML ──
     try:
-        html = generate_html(repos)
-        with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+        html = generate_html(repos, since_days=since_days, language=language)
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write(html)
     except OSError as e:
         print(f"[FATAL] Cannot write HTML output: {e}", file=sys.stderr)
         sys.exit(2)
 
     status = "[cache]" if used_cache else "[live]"
-    print(f"[OK] Sticky note written {status}: {OUTPUT_HTML}")
+    print(f"[OK] Sticky note written {status}: {output_path}")
     print(f"[OK] {len(repos)} repos displayed.")
 
     sys.exit(1 if used_cache else 0)
